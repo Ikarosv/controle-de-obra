@@ -16,18 +16,48 @@ async function main() {
 
   // 2. Se houver um banco PostgreSQL ativo (Vercel Postgres / Supabase / Docker), popula via Prisma
   try {
-    const adminPasswordHash = await bcrypt.hash("admin123", 10);
-    await prisma.user.upsert({
-      where: { email: "admin@obra.com" },
-      update: {},
-      create: {
-        name: "Ikaro (Administrador)",
-        email: "admin@obra.com",
-        passwordHash: adminPasswordHash,
-        role: "ADMIN",
-        avatarColor: "#292524",
-      },
-    });
+    for (const u of store.users) {
+      await prisma.user.upsert({
+        where: { email: u.email },
+        update: {},
+        create: {
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          passwordHash: u.passwordHash,
+          role: u.role,
+          avatarColor: u.avatarColor,
+          phone: u.phone,
+        },
+      });
+    }
+
+    for (const c of store.categories) {
+      await prisma.category.upsert({
+        where: { id: c.id },
+        update: {},
+        create: {
+          id: c.id,
+          name: c.name,
+          description: c.description,
+          budgetLimit: c.budgetLimit ? new Prisma.Decimal(c.budgetLimit) : null,
+        },
+      });
+    }
+
+    const defaultSettings = store.projectSettings || store.settings;
+    if (defaultSettings) {
+      await prisma.projectSettings.upsert({
+        where: { id: "default" },
+        update: {},
+        create: {
+          id: "default",
+          projectName: defaultSettings.projectName,
+          officialPixKey: defaultSettings.officialPixKey,
+          pixReceiverName: defaultSettings.pixReceiverName,
+        },
+      });
+    }
 
     for (const st of store.stageBudgets) {
       await prisma.stageBudget.upsert({
@@ -42,9 +72,10 @@ async function main() {
     }
 
     console.log("Sincronização PostgreSQL concluída com sucesso!");
-  } catch {
+  } catch (err) {
     console.log(
-      "PostgreSQL remoto não detectado no momento. O repositório local persistente (.data/controle-obra-db.json) está 100% ativo e populado."
+      "PostgreSQL remoto não detectado ou erro na sincronização:",
+      err
     );
   } finally {
     await prisma.$disconnect();
