@@ -1,5 +1,6 @@
 // src/lib/db.ts
 import fs from "fs";
+import os from "os";
 import path from "path";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/prisma";
@@ -88,7 +89,15 @@ export interface LocalDatabaseSchema {
   settings?: ProjectSettingsRecord;
 }
 
-const DATA_DIR = path.join(process.cwd(), ".data");
+function resolveWritableDataDir(): string {
+  const defaultDir = path.join(process.cwd(), ".data");
+  if (process.env.VERCEL === "1" || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join(os.tmpdir(), "controle-obra-data");
+  }
+  return defaultDir;
+}
+
+const DATA_DIR = resolveWritableDataDir();
 const DB_FILE = path.join(DATA_DIR, "controle-obra-db.json");
 
 export const DEFAULT_PROJECT_SETTINGS: ProjectSettingsRecord = {
@@ -495,15 +504,19 @@ function buildInitialSeed(): LocalDatabaseSchema {
 }
 
 export function readLocalStore(): LocalDatabaseSchema {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (!fs.existsSync(DB_FILE)) {
-    const initial = buildInitialSeed();
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), "utf-8");
-    return initial;
-  }
   try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(DB_FILE)) {
+      const initial = buildInitialSeed();
+      try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), "utf-8");
+      } catch {
+        // Ignore read-only filesystem write errors
+      }
+      return initial;
+    }
     const raw = fs.readFileSync(DB_FILE, "utf-8");
     const parsed = JSON.parse(raw) as Partial<LocalDatabaseSchema>;
     let needsMigration = false;
@@ -541,27 +554,33 @@ export function readLocalStore(): LocalDatabaseSchema {
     };
 
     if (needsMigration) {
-      fs.writeFileSync(DB_FILE, JSON.stringify(store, null, 2), "utf-8");
+      try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(store, null, 2), "utf-8");
+      } catch {
+        // Ignore read-only filesystem write errors
+      }
     }
 
     return store;
   } catch {
-    const initial = buildInitialSeed();
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2), "utf-8");
-    return initial;
+    return buildInitialSeed();
   }
 }
 
 export function writeLocalStore(data: LocalDatabaseSchema): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const syncedSettings = data.projectSettings || data.settings || {
+      ...DEFAULT_PROJECT_SETTINGS,
+    };
+    data.projectSettings = syncedSettings;
+    data.settings = syncedSettings;
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[writeLocalStore Warning]:", err);
   }
-  const syncedSettings = data.projectSettings || data.settings || {
-    ...DEFAULT_PROJECT_SETTINGS,
-  };
-  data.projectSettings = syncedSettings;
-  data.settings = syncedSettings;
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
 }
 
 // Detecta se existe um banco PostgreSQL remoto configurado de fato (Vercel Postgres / Supabase)

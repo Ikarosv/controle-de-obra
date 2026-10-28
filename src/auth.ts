@@ -12,9 +12,16 @@ const loginSchema = z.object({
 });
 
 function resolveAuthSecret(): string {
-  const envSecret = process.env.AUTH_SECRET?.trim();
+  const envSecret = (
+    process.env.AUTH_SECRET || process.env.NEXTAUTH_SECRET
+  )?.trim();
   if (envSecret && envSecret.length >= 16) {
     return envSecret;
+  }
+  const vercelAutoSecret =
+    process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+  if (vercelAutoSecret) {
+    return `vercel-derived-auth-secret-${vercelAutoSecret}-controle-obra-2026`;
   }
   if (process.env.NODE_ENV === "production") {
     throw new Error(
