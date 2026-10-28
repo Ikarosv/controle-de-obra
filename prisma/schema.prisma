@@ -1,0 +1,129 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  PARTICIPANT
+}
+
+enum SplitStatus {
+  PENDING
+  PAID
+}
+
+model User {
+  id           String      @id @default(uuid()) @db.Uuid
+  name         String
+  email        String      @unique
+  passwordHash String      @map("password_hash")
+  role         Role        @default(PARTICIPANT)
+  avatarColor  String      @default("#C26D53") @map("avatar_color")
+  phone        String?
+  splits       ItemSplit[]
+
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+model Category {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String    @unique // Ex: Elétrica, Hidráulica, Fundação, Acabamento
+  description String?
+  budgetLimit Decimal?  @map("budget_limit") @db.Decimal(12, 2) // Meta de orçamento por categoria
+  invoices    Invoice[]
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@map("categories")
+}
+
+model StageBudget {
+  id          String   @id @default(uuid()) @db.Uuid
+  stage       String   @unique // Ex: Terraplenagem & Fundação, Estrutura & Alvenaria...
+  budgetLimit Decimal  @map("budget_limit") @db.Decimal(12, 2)
+  orderIndex  Int      @default(0) @map("order_index")
+
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("stage_budgets")
+}
+
+model Invoice {
+  id             String        @id @default(uuid()) @db.Uuid
+  documentNumber String        @map("document_number")
+  supplier       String        @default("Fornecedor Geral") // Loja / Fornecedor
+  date           DateTime      @db.Date
+  categoryId     String        @map("category_id") @db.Uuid
+  category       Category      @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  installments   Int           @default(1) // Quantidade de parcelas da NF
+  pixKey         String        @map("pix_key") // Chave PIX do Admin para reembolso desta nota
+  paidBy         String        @default("Administrador") @map("paid_by") // Quem pagou a loja
+  observations   String?       @db.Text
+  items          InvoiceItem[]
+
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+
+  @@index([categoryId])
+  @@index([date(sort: Desc)])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id          String      @id @default(uuid()) @db.Uuid
+  invoiceId   String      @map("invoice_id") @db.Uuid
+  invoice     Invoice     @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  unit        String      @default("un") // un, sc, m², m³, kg, vb
+  quantity    Float
+  totalValue  Decimal     @map("total_value") @db.Decimal(12, 2)
+  stage       String      // Etapa específica do item (ex: Alvenaria, Fundação)
+  splitModel  String      @default("50/50") @map("split_model") // Ex: 50/50, 60/40, 100% P1, CUSTOM
+  splits      ItemSplit[]
+
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  @@index([invoiceId])
+  @@index([stage])
+  @@map("invoice_items")
+}
+
+model ItemSplit {
+  id            String      @id @default(uuid()) @db.Uuid
+  invoiceItemId String      @map("invoice_item_id") @db.Uuid
+  invoiceItem   InvoiceItem @relation(fields: [invoiceItemId], references: [id], onDelete: Cascade)
+  userId        String      @map("user_id") @db.Uuid
+  user          User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  amountDue     Decimal     @map("amount_due") @db.Decimal(12, 2)
+  status        SplitStatus @default(PENDING)
+  paidAt        DateTime?   @map("paid_at")
+  paymentNote   String?     @map("payment_note")
+
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  @@unique([invoiceItemId, userId])
+  @@index([userId, status])
+  @@map("item_splits")
+}
+
+model ProjectSettings {
+  id              String   @id @default("default")
+  projectName     String   @default("Residência • Controle de Obra") @map("project_name")
+  officialPixKey  String   @default("obra.residencial@pix.com.br") @map("official_pix_key")
+  pixReceiverName String   @default("Ikaro (Administrador)") @map("pix_receiver_name")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("project_settings")
+}
+

@@ -1,0 +1,55 @@
+/* src/app/globals.css */
+@import "tailwindcss";
+
+@theme {
+  --font-display: var(--font-space-grotesk), sans-serif;
+  --font-sans: var(--font-jakarta), sans-serif;
+
+  /* Paleta Warm Minimalism */
+  --color-canvas: #FAF8F5;
+  --color-surface: #FFFFFF;
+  --color-surface-muted: #F3EFEA;
+  --color-border-warm: #E6E1DA;
+  --color-ink: #1C1917;
+  --color-ink-muted: #78716C;
+  --color-accent: #292524;
+  --color-terracotta: #C26D53;
+  --color-sage: #4D6B53;
+  --color-amber-warm: #B8860B;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #FAF8F5;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #D6CFC5;
+  border-radius: 9999px;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background-color: #FFFFFF !important;
+  }
+}
