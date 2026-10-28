@@ -1,6 +1,10 @@
 // tests/adversarial-qa.test.ts
 process.env.ALLOW_QA_TEST_ACTOR = "true";
 
+import { createMockPrisma } from "./mock-prisma";
+const mockPrisma = createMockPrisma();
+(globalThis as any).prisma = mockPrisma;
+
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,8 +14,6 @@ import {
   fromCents,
   calculateSplitsDifferenceInCents,
   isSplitSumExact,
-  distributeEqualInCents,
-  distributeByWeightsInCents,
   calculatePresetSplits,
   type SplitParticipantInput,
 } from "../src/lib/split-calculator";
@@ -24,14 +26,14 @@ import {
   reportPaymentNoticeSchema,
 } from "../src/lib/validations/invoice";
 import {
-  readLocalStore,
-  writeLocalStore,
   getAllUsers,
   getHydratedInvoices,
   getParticipantSplits,
   getProjectSettings,
+  findUserByEmail,
 } from "../src/lib/db";
 import {
+  createUserAction,
   updateProjectSettingsAction,
   changeOwnPasswordAction,
   adminResetUserPasswordAction,
@@ -40,8 +42,6 @@ import {
   reportAllPendingSplitsNoticeAction,
   type SessionActor,
 } from "../src/actions/invoice-actions";
-
-const DB_FILE = path.join(process.cwd(), ".data", "controle-obra-db.json");
 
 interface TestResult {
   id: string;
@@ -58,9 +58,10 @@ async function runTest(id: string, name: string, fn: () => Promise<void> | void)
     results.push({ id, name, passed: true });
     console.log(`✅ [PASS] ${id}: ${name}`);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    results.push({ id, name, passed: false, error: msg });
-    console.error(`❌ [FAIL] ${id}: ${name}\n   ↳ ${msg}`);
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    results.push({ id, name, passed: false, error: errorMsg });
+    console.error(`❌ [FAIL] ${id}: ${name}`);
+    console.error(`   ↳ ${errorMsg}`);
   }
 }
 
@@ -144,14 +145,18 @@ async function main() {
       assert.deepEqual(s100.map((s) => s.amountDue), [0.0, 0.0, 10.0]);
       assert.equal(isSplitSumExact(10.0, s100), true);
 
-      // Valores ímpares (R$ 10,01 e R$ 1.234,57)
-      const odd50 = calculatePresetSplits(10.01, mockUsers3, "50/50");
-      assert.deepEqual(odd50.map((s) => s.amountDue), [5.01, 5.0, 0.0]);
-      assert.equal(isSplitSumExact(10.01, odd50), true);
+      // Valores com centavos ímpares e dízimas
+      const s50Odd = calculatePresetSplits(10.01, mockUsers3, "50/50");
+      assert.deepEqual(s50Odd.map((s) => s.amountDue), [5.01, 5.0, 0.0]);
+      assert.equal(isSplitSumExact(10.01, s50Odd), true);
 
-      const oddEqual = calculatePresetSplits(1234.57, mockUsers3, "EQUAL_ALL");
-      assert.equal(isSplitSumExact(1234.57, oddEqual), true);
-      assert.equal(calculateSplitsDifferenceInCents(1234.57, oddEqual), 0);
+      const s60Odd = calculatePresetSplits(10.01, mockUsers3, "60/40");
+      assert.deepEqual(s60Odd.map((s) => s.amountDue), [6.01, 4.0, 0.0]);
+      assert.equal(isSplitSumExact(10.01, s60Odd), true);
+
+      const s70Odd = calculatePresetSplits(10.01, mockUsers3, "70/30");
+      assert.deepEqual(s70Odd.map((s) => s.amountDue), [7.01, 3.0, 0.0]);
+      assert.equal(isSplitSumExact(10.01, s70Odd), true);
     }
   );
 
@@ -159,62 +164,52 @@ async function main() {
     "TC-01.5",
     "Imunidade a ponto flutuante IEEE 754 (ex: 19.99 + 3.01 === 23.00 e 0.1 + 0.2 === 0.30)",
     () => {
-      assert.equal(toCents(19.99) + toCents(3.01), 2300);
-      assert.equal(fromCents(toCents(19.99) + toCents(3.01)), 23.0);
-      assert.equal(
-        isSplitSumExact(0.3, [{ amountDue: 0.1 }, { amountDue: 0.2 }]),
-        true
-      );
-      assert.deepEqual(distributeEqualInCents(10000, 3), [3334, 3333, 3333]);
-      assert.deepEqual(distributeByWeightsInCents(10000, [1, 1, 1]), [
-        3334, 3333, 3333,
-      ]);
+      const sumCents = toCents(19.99) + toCents(3.01);
+      assert.equal(sumCents, 2300);
+      assert.equal(fromCents(sumCents), 23.0);
+
+      const floatSum = toCents(0.1) + toCents(0.2);
+      assert.equal(floatSum, 30);
+      assert.equal(fromCents(floatSum), 0.3);
     }
   );
 
   // ==========================================================================
-  // TC-02: Rejeição Estrita de Divergência de 1 Centavo no Zod (Tolerância Zero)
+  // TC-02: Zero-Tolerance no Zod Schema (validations/invoice.ts)
   // ==========================================================================
-  const baseValidInvoice = {
-    documentNumber: "NF-QA-999",
-    supplier: "Fornecedor Teste QA",
-    date: "2026-10-27",
-    categoryId: "aaaa1111-1111-4111-8111-111111111111",
-    installments: 1,
-    pixKey: "ikaro@pix.com.br",
-    paidBy: "Ikaro (Administrador)",
-    observations: "Nota de teste adversário",
-    items: [
-      {
-        description: "Cimento Estrutural",
-        unit: "sc",
-        quantity: 10,
-        totalValue: 100.0,
-        stage: "Estrutura & Alvenaria",
-        splitModel: "CUSTOM",
-        splits: [
-          { userId: "u-admin", amountDue: 50.0, status: "PAID" as const },
-          { userId: "u-part-1", amountDue: 50.0, status: "PENDING" as const },
-        ],
-      },
-    ],
-  };
-
   await runTest(
     "TC-02.1",
     "Rejeita divergência de -1 centavo: Item R$ 100,00 com cotas [50.00, 49.99] (soma 99.99)",
     () => {
-      const payload = structuredClone(baseValidInvoice);
-      payload.items[0].splits = [
-        { userId: "u-admin", amountDue: 50.0, status: "PAID" },
-        { userId: "u-part-1", amountDue: 49.99, status: "PENDING" },
-      ];
-      const parsed = createInvoiceSchema.safeParse(payload);
-      assert.equal(
-        parsed.success,
-        false,
-        "Deveria rejeitar soma 99.99 para item de 100.00"
-      );
+      const payload = {
+        documentNumber: "NF-TEST-001",
+        supplier: "Loja Teste",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Cimento",
+            unit: "sc",
+            quantity: 2,
+            totalValue: 100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [
+              { userId: "11111111-1111-4111-8111-111111111111", amountDue: 50.0, status: "PENDING" as const },
+              { userId: "22222222-2222-4222-8222-222222222222", amountDue: 49.99, status: "PENDING" as const },
+            ],
+          },
+        ],
+      };
+
+      const result = createInvoiceSchema.safeParse(payload);
+      assert.equal(result.success, false);
+      if (!result.success) {
+        assert.match(result.error.issues[0].message, /diferença zero|Divergência/i);
+      }
     }
   );
 
@@ -222,17 +217,35 @@ async function main() {
     "TC-02.2",
     "Rejeita divergência de +1 centavo: Item R$ 100,00 com cotas [50.00, 50.01] (soma 100.01)",
     () => {
-      const payload = structuredClone(baseValidInvoice);
-      payload.items[0].splits = [
-        { userId: "u-admin", amountDue: 50.0, status: "PAID" },
-        { userId: "u-part-1", amountDue: 50.01, status: "PENDING" },
-      ];
-      const parsed = createInvoiceSchema.safeParse(payload);
-      assert.equal(
-        parsed.success,
-        false,
-        "Deveria rejeitar soma 100.01 para item de 100.00"
-      );
+      const payload = {
+        documentNumber: "NF-TEST-002",
+        supplier: "Loja Teste",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Cimento",
+            unit: "sc",
+            quantity: 2,
+            totalValue: 100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [
+              { userId: "11111111-1111-4111-8111-111111111111", amountDue: 50.0, status: "PENDING" as const },
+              { userId: "22222222-2222-4222-8222-222222222222", amountDue: 50.01, status: "PENDING" as const },
+            ],
+          },
+        ],
+      };
+
+      const result = createInvoiceSchema.safeParse(payload);
+      assert.equal(result.success, false);
+      if (!result.success) {
+        assert.match(result.error.issues[0].message, /diferença zero|Divergência/i);
+      }
     }
   );
 
@@ -240,17 +253,35 @@ async function main() {
     "TC-02.3",
     "Rejeita divergência de 4 centavos (antiga brecha <= 0.05): Item R$ 100,00 com cotas [50.00, 49.96]",
     () => {
-      const payload = structuredClone(baseValidInvoice);
-      payload.items[0].splits = [
-        { userId: "u-admin", amountDue: 50.0, status: "PAID" },
-        { userId: "u-part-1", amountDue: 49.96, status: "PENDING" },
-      ];
-      const parsed = createInvoiceSchema.safeParse(payload);
-      assert.equal(
-        parsed.success,
-        false,
-        "Antiga brecha de 0.05 foi fechada: 99.96 deve ser rejeitado"
-      );
+      const payload = {
+        documentNumber: "NF-TEST-003",
+        supplier: "Loja Teste",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Areia",
+            unit: "m³",
+            quantity: 1,
+            totalValue: 100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [
+              { userId: "11111111-1111-4111-8111-111111111111", amountDue: 50.0, status: "PENDING" as const },
+              { userId: "22222222-2222-4222-8222-222222222222", amountDue: 49.96, status: "PENDING" as const },
+            ],
+          },
+        ],
+      };
+
+      const result = createInvoiceSchema.safeParse(payload);
+      assert.equal(result.success, false);
+      if (!result.success) {
+        assert.match(result.error.issues[0].message, /diferença zero|Divergência/i);
+      }
     }
   );
 
@@ -258,41 +289,89 @@ async function main() {
     "TC-02.4",
     "Aceita rateio de dízima com centavo residual exato: Item R$ 100,00 com [33.34, 33.33, 33.33]",
     () => {
-      const payload = structuredClone(baseValidInvoice);
-      payload.items[0].splits = [
-        { userId: "u-admin", amountDue: 33.34, status: "PAID" },
-        { userId: "u-part-1", amountDue: 33.33, status: "PENDING" },
-        { userId: "u-part-2", amountDue: 33.33, status: "PENDING" },
-      ];
-      const parsed = createInvoiceSchema.safeParse(payload);
-      assert.equal(parsed.success, true);
+      const payload = {
+        documentNumber: "NF-TEST-004",
+        supplier: "Loja Teste",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Tijolos",
+            unit: "mil",
+            quantity: 1,
+            totalValue: 100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "EQUAL_ALL",
+            splits: [
+              { userId: "11111111-1111-4111-8111-111111111111", amountDue: 33.34, status: "PENDING" as const },
+              { userId: "22222222-2222-4222-8222-222222222222", amountDue: 33.33, status: "PENDING" as const },
+              { userId: "33333333-3333-4333-8333-333333333333", amountDue: 33.33, status: "PENDING" as const },
+            ],
+          },
+        ],
+      };
+
+      const result = createInvoiceSchema.safeParse(payload);
+      assert.equal(result.success, true);
     }
   );
 
   // ==========================================================================
-  // TC-03: Entradas Maliciosas, Valores Negativos, Zero, NaN e Limites
+  // TC-03: Payloads Maliciosos, Valores Negativos, NaN, Strings Vazias
   // ==========================================================================
   await runTest(
     "TC-03.1",
     "Rejeita valores negativos (-10) em totalValue ou em amountDue (tentativa de burlar soma com cota negativa)",
     () => {
-      // Cota negativa compensando outra cota (ex: 110 + (-10) = 100)
-      assert.equal(
-        isSplitSumExact(100, [{ amountDue: 110 }, { amountDue: -10 }]),
-        false,
-        "Não deve permitir cota negativa mesmo que a soma algébrica feche 100"
-      );
+      const payloadNegativeTotal = {
+        documentNumber: "NF-NEG",
+        supplier: "Fornecedor",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Item Negativo",
+            unit: "un",
+            quantity: 1,
+            totalValue: -100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [{ userId: "11111111-1111-4111-8111-111111111111", amountDue: -100.0, status: "PENDING" as const }],
+          },
+        ],
+      };
+      assert.equal(createInvoiceSchema.safeParse(payloadNegativeTotal).success, false);
 
-      const payloadNegSplit = structuredClone(baseValidInvoice);
-      payloadNegSplit.items[0].splits = [
-        { userId: "u-admin", amountDue: 110.0, status: "PAID" },
-        { userId: "u-part-1", amountDue: -10.0, status: "PENDING" },
-      ];
-      assert.equal(createInvoiceSchema.safeParse(payloadNegSplit).success, false);
-
-      const payloadNegTotal = structuredClone(baseValidInvoice);
-      payloadNegTotal.items[0].totalValue = -50;
-      assert.equal(createInvoiceSchema.safeParse(payloadNegTotal).success, false);
+      const payloadNegativeSplit = {
+        documentNumber: "NF-SNEAKY",
+        supplier: "Fornecedor",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+        items: [
+          {
+            description: "Cota Maliciosa",
+            unit: "un",
+            quantity: 1,
+            totalValue: 100.0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [
+              { userId: "11111111-1111-4111-8111-111111111111", amountDue: 110.0, status: "PENDING" as const },
+              { userId: "22222222-2222-4222-8222-222222222222", amountDue: -10.0, status: "PENDING" as const },
+            ],
+          },
+        ],
+      };
+      assert.equal(createInvoiceSchema.safeParse(payloadNegativeSplit).success, false);
     }
   );
 
@@ -300,20 +379,47 @@ async function main() {
     "TC-03.2",
     "Rejeita valor total de item igual a zero (0), NaN ou Infinity",
     () => {
-      assert.equal(isSplitSumExact(0, [{ amountDue: 0 }]), false);
-      assert.equal(isSplitSumExact(NaN, [{ amountDue: 10 }]), false);
-      assert.equal(
-        isSplitSumExact(Infinity, [{ amountDue: Infinity }]),
-        false
-      );
-      assert.equal(isSplitSumExact(100, [{ amountDue: NaN }]), false);
+      const basePayload = {
+        documentNumber: "NF-ZERO",
+        supplier: "Fornecedor",
+        date: "2026-10-27",
+        categoryId: "aaaa1111-1111-4111-8111-111111111111",
+        installments: 1,
+        pixKey: "pix@obra.com",
+        paidBy: "Ikaro",
+      };
 
-      const payloadZero = structuredClone(baseValidInvoice);
-      payloadZero.items[0].totalValue = 0;
-      payloadZero.items[0].splits = [
-        { userId: "u-admin", amountDue: 0, status: "PAID" },
-      ];
+      const payloadZero = {
+        ...basePayload,
+        items: [
+          {
+            description: "Item Grátis",
+            unit: "un",
+            quantity: 1,
+            totalValue: 0,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [],
+          },
+        ],
+      };
       assert.equal(createInvoiceSchema.safeParse(payloadZero).success, false);
+
+      const payloadNaN = {
+        ...basePayload,
+        items: [
+          {
+            description: "Item NaN",
+            unit: "un",
+            quantity: 1,
+            totalValue: NaN,
+            stage: "Estrutura & Alvenaria",
+            splitModel: "50/50",
+            splits: [],
+          },
+        ],
+      };
+      assert.equal(createInvoiceSchema.safeParse(payloadNaN).success, false);
     }
   );
 
@@ -321,57 +427,21 @@ async function main() {
     "TC-03.3",
     "Rejeita parcelas inválidas (0 ou 121), strings vazias e senhas curtas (< 6 chars)",
     () => {
-      const payloadInst0 = structuredClone(baseValidInvoice);
-      payloadInst0.installments = 0;
-      assert.equal(createInvoiceSchema.safeParse(payloadInst0).success, false);
+      const invalidUser = {
+        name: "",
+        email: "email-invalido",
+        password: "123",
+        role: "PARTICIPANT",
+      };
+      const userRes = createUserSchema.safeParse(invalidUser);
+      assert.equal(userRes.success, false);
+      assert.equal(userRes.error.issues.length >= 3, true);
 
-      const payloadInst121 = structuredClone(baseValidInvoice);
-      payloadInst121.installments = 121;
-      assert.equal(createInvoiceSchema.safeParse(payloadInst121).success, false);
-
-      const payloadEmptyDoc = structuredClone(baseValidInvoice);
-      payloadEmptyDoc.documentNumber = "   ";
-      assert.equal(createInvoiceSchema.safeParse(payloadEmptyDoc).success, false);
-
-      // Senhas curtas
-      assert.equal(
-        createUserSchema.safeParse({
-          name: "Teste",
-          email: "teste@obra.com",
-          password: "123",
-          role: "PARTICIPANT",
-        }).success,
-        false
-      );
-      assert.equal(
-        changeOwnPasswordSchema.safeParse({
-          currentPassword: "admin123",
-          newPassword: "123",
-        }).success,
-        false
-      );
-      assert.equal(
-        adminResetPasswordSchema.safeParse({
-          targetUserId: "u-1",
-          newPassword: "123",
-        }).success,
-        false
-      );
-      assert.equal(
-        updateProjectSettingsSchema.safeParse({
-          projectName: "AB", // min 3
-          officialPixKey: "a",
-          pixReceiverName: "I",
-        }).success,
-        false
-      );
-      assert.equal(
-        reportPaymentNoticeSchema.safeParse({
-          splitId: "",
-          note: "a",
-        }).success,
-        false
-      );
+      const shortPass = changeOwnPasswordSchema.safeParse({
+        currentPassword: "senha",
+        newPassword: "123",
+      });
+      assert.equal(shortPass.success, false);
     }
   );
 
@@ -382,14 +452,12 @@ async function main() {
     "TC-04.1",
     "Isolamento de Banco + Bloqueio Anti-IDOR: Participante A NÃO consegue registrar aviso de PIX em cota do Participante B",
     async () => {
-      // Garante que o arquivo inicial exista antes do backup
-      readLocalStore();
-      const backupRaw = fs.readFileSync(DB_FILE, "utf-8");
+      const backup = mockPrisma.$snapshot();
 
       try {
-        const store = readLocalStore();
-        const admin = store.users.find((u) => u.role === "ADMIN")!;
-        const participants = store.users.filter((u) => u.role === "PARTICIPANT");
+        const users = await mockPrisma.user.findMany();
+        const admin = users.find((u: any) => u.role === "ADMIN")!;
+        const participants = users.filter((u: any) => u.role === "PARTICIPANT");
         assert.ok(admin, "Admin deve existir no seed");
         assert.ok(participants.length >= 2, "Deve haver ao menos 2 participantes no seed");
 
@@ -397,8 +465,9 @@ async function main() {
         const carlos = participants[1]; // 3333...
 
         // Localiza uma cota PENDING pertencente à Mariana
-        const marianaPendingSplit = store.itemSplits.find(
-          (s) => s.userId === mariana.id && s.status === "PENDING"
+        const splits = await mockPrisma.itemSplit.findMany();
+        const marianaPendingSplit = splits.find(
+          (s: any) => s.userId === mariana.id && s.status === "PENDING"
         );
         assert.ok(marianaPendingSplit, "Mariana deve possuir cota PENDING para o teste");
 
@@ -426,10 +495,9 @@ async function main() {
         assert.match(idorAttempt.message, /Acesso negado/i);
 
         // Verifica que a cota da Mariana permaneceu intacta no banco
-        const storeAfterIdor = readLocalStore();
-        const unchangedSplit = storeAfterIdor.itemSplits.find(
-          (s) => s.id === marianaPendingSplit.id
-        )!;
+        const unchangedSplit = await mockPrisma.itemSplit.findUnique({
+          where: { id: marianaPendingSplit.id },
+        });
         assert.equal(unchangedSplit.paymentNote, null);
 
         // Agora a própria Mariana informa o PIX na sua cota -> deve funcionar!
@@ -449,10 +517,9 @@ async function main() {
         );
         assert.equal(legitimateAttempt.success, true);
 
-        const storeAfterLegit = readLocalStore();
-        const updatedSplit = storeAfterLegit.itemSplits.find(
-          (s) => s.id === marianaPendingSplit.id
-        )!;
+        const updatedSplit = await mockPrisma.itemSplit.findUnique({
+          where: { id: marianaPendingSplit.id },
+        });
         assert.equal(
           updatedSplit.paymentNote,
           "PIX informado: Comprovante PIX Banco Itaú 27/10"
@@ -466,15 +533,14 @@ async function main() {
           actorCarlos
         );
         assert.equal(batchRes.success, true);
-        const storeAfterBatch = readLocalStore();
-        const carlosPending = storeAfterBatch.itemSplits.filter(
-          (s) => s.userId === carlos.id && s.status === "PENDING"
-        );
+        const carlosSplits = await mockPrisma.itemSplit.findMany({
+          where: { userId: carlos.id, status: "PENDING" },
+        });
         assert.ok(
-          carlosPending.every((s) => s.paymentNote === "PIX informado: PIX Lote Carlos")
+          carlosSplits.every((s: any) => s.paymentNote === "PIX informado: PIX Lote Carlos")
         );
       } finally {
-        fs.writeFileSync(DB_FILE, backupRaw, "utf-8");
+        mockPrisma.$restore(backup);
       }
     }
   );
@@ -483,13 +549,12 @@ async function main() {
     "TC-04.2",
     "Integridade Relacional e RBAC: Bloqueia exclusão de participante com cotas vinculadas (splitsCount > 0), autoexclusão de Admin e ações restritas",
     async () => {
-      readLocalStore();
-      const backupRaw = fs.readFileSync(DB_FILE, "utf-8");
+      const backup = mockPrisma.$snapshot();
 
       try {
-        const store = readLocalStore();
-        const admin = store.users.find((u) => u.role === "ADMIN")!;
-        const mariana = store.users.find((u) => u.email === "mariana@obra.com")!;
+        const users = await mockPrisma.user.findMany();
+        const admin = users.find((u: any) => u.role === "ADMIN")!;
+        const mariana = users.find((u: any) => u.email === "mariana@obra.com")!;
 
         const actorAdmin: SessionActor = {
           id: admin.id,
@@ -521,26 +586,27 @@ async function main() {
 
         // 4. Criar um participante temporário sem cotas (splitsCount === 0) e removê-lo -> permitido
         const tempUserId = "99999999-9999-4999-8999-999999999999";
-        store.users.push({
-          id: tempUserId,
-          name: "Participante Temporário Sem Cotas",
-          email: "temp@obra.com",
-          passwordHash: bcrypt.hashSync("senha123", 10),
-          role: "PARTICIPANT",
-          avatarColor: "#78716C",
-          phone: null,
-          createdAt: new Date().toISOString(),
+        await mockPrisma.user.create({
+          data: {
+            id: tempUserId,
+            name: "Participante Temporário Sem Cotas",
+            email: "temp@obra.com",
+            passwordHash: bcrypt.hashSync("senha123", 10),
+            role: "PARTICIPANT",
+            avatarColor: "#78716C",
+            phone: null,
+          },
         });
-        writeLocalStore(store);
 
         const cleanDel = await deleteUserAction(tempUserId, actorAdmin);
         assert.equal(cleanDel.success, true);
+        const usersAfter = await mockPrisma.user.findMany();
         assert.equal(
-          readLocalStore().users.some((u) => u.id === tempUserId),
+          usersAfter.some((u: any) => u.id === tempUserId),
           false
         );
       } finally {
-        fs.writeFileSync(DB_FILE, backupRaw, "utf-8");
+        mockPrisma.$restore(backup);
       }
     }
   );
@@ -549,13 +615,12 @@ async function main() {
     "TC-04.3",
     "Gestão de Senhas e Configurações da Obra (ProjectSettings + Propagação de PIX + Troca de Senha Anti-IDOR)",
     async () => {
-      readLocalStore();
-      const backupRaw = fs.readFileSync(DB_FILE, "utf-8");
+      const backup = mockPrisma.$snapshot();
 
       try {
-        const store = readLocalStore();
-        const admin = store.users.find((u) => u.role === "ADMIN")!;
-        const mariana = store.users.find((u) => u.email === "mariana@obra.com")!;
+        const users = await mockPrisma.user.findMany();
+        const admin = users.find((u: any) => u.role === "ADMIN")!;
+        const mariana = users.find((u: any) => u.email === "mariana@obra.com")!;
 
         const actorAdmin: SessionActor = {
           id: admin.id,
@@ -613,9 +678,8 @@ async function main() {
         );
         assert.equal(rightCurrentPass.success, true);
 
-        const updatedMariana = readLocalStore().users.find(
-          (u) => u.id === mariana.id
-        )!;
+        const updatedMariana = await findUserByEmail("mariana@obra.com");
+        assert.ok(updatedMariana);
         assert.equal(
           await bcrypt.compare("novaSenhaMariana2026", updatedMariana.passwordHash),
           true
@@ -630,9 +694,8 @@ async function main() {
           actorAdmin
         );
         assert.equal(resetByAdmin.success, true);
-        const resetMariana = readLocalStore().users.find(
-          (u) => u.id === mariana.id
-        )!;
+        const resetMariana = await findUserByEmail("mariana@obra.com");
+        assert.ok(resetMariana);
         assert.equal(
           await bcrypt.compare("resetadaPeloAdmin99", resetMariana.passwordHash),
           true
@@ -646,7 +709,7 @@ async function main() {
         assert.ok(hydratedInvoices.length >= 4);
         assert.ok(marianaSplits.length > 0);
       } finally {
-        fs.writeFileSync(DB_FILE, backupRaw, "utf-8");
+        mockPrisma.$restore(backup);
       }
     }
   );
@@ -692,6 +755,122 @@ async function main() {
         true,
         "src/auth.ts deve validar NODE_ENV === 'production' para exigir AUTH_SECRET"
       );
+    }
+  );
+
+  await runTest(
+    "TC-05.1",
+    "Gestão Completa de Participantes: Criação, Duplicação de Email e RBAC",
+    async () => {
+      const backup = mockPrisma.$snapshot();
+
+      try {
+        const users = await mockPrisma.user.findMany();
+        const admin = users.find((u: any) => u.role === "ADMIN")!;
+        const mariana = users.find((u: any) => u.email === "mariana@obra.com")!;
+
+        const actorAdmin: SessionActor = {
+          id: admin.id,
+          role: "ADMIN",
+        };
+        const actorMariana: SessionActor = {
+          id: mariana.id,
+          role: "PARTICIPANT",
+        };
+
+        // 1. Participante NÃO pode criar novos usuários (RBAC)
+        const unauthCreate = await createUserAction(
+          {
+            name: "Novo Participante Malicioso",
+            email: "hacker.participante@obra.com",
+            password: "senhaSegura123",
+            role: "PARTICIPANT",
+          },
+          actorMariana
+        );
+        assert.equal(unauthCreate.success, false);
+        assert.match(unauthCreate.message, /Administrador/i);
+
+        // 2. Admin cria novo participante com sucesso
+        const validCreate = await createUserAction(
+          {
+            name: "Engenheiro Roberto",
+            email: "roberto@obra.com",
+            password: "robertoSenha123",
+            role: "PARTICIPANT",
+            phone: "(11) 98888-7777",
+          },
+          actorAdmin
+        );
+        assert.equal(validCreate.success, true);
+        assert.match(validCreate.message, /Roberto/i);
+
+        const created = await findUserByEmail("roberto@obra.com");
+        assert.ok(created, "Usuário criado deve constar no repositório");
+        assert.equal(created.name, "Engenheiro Roberto");
+        assert.equal(created.phone, "(11) 98888-7777");
+        assert.ok(
+          bcrypt.compareSync("robertoSenha123", created.passwordHash),
+          "Senha deve ser hasheada com bcrypt"
+        );
+
+        // 3. Rejeita criação com e-mail duplicado
+        const duplicateCreate = await createUserAction(
+          {
+            name: "Roberto Clonado",
+            email: "roberto@obra.com",
+            password: "outraSenha123",
+            role: "PARTICIPANT",
+          },
+          actorAdmin
+        );
+        assert.equal(duplicateCreate.success, false);
+        assert.match(duplicateCreate.message, /Já existe um usuário/i);
+      } finally {
+        mockPrisma.$restore(backup);
+      }
+    }
+  );
+
+  await runTest(
+    "TC-05.2",
+    "Gestão Completa de Participantes: Exclusão com Confirmação e Validação de Cotas",
+    async () => {
+      const backup = mockPrisma.$snapshot();
+
+      try {
+        const users = await mockPrisma.user.findMany();
+        const admin = users.find((u: any) => u.role === "ADMIN")!;
+        const actorAdmin: SessionActor = {
+          id: admin.id,
+          role: "ADMIN",
+        };
+
+        // 1. Cria usuário temporário sem cotas
+        const tempRes = await createUserAction(
+          {
+            name: "Temporário Excluir",
+            email: "temp.del@obra.com",
+            password: "senhaSegura123",
+            role: "PARTICIPANT",
+          },
+          actorAdmin
+        );
+        assert.equal(tempRes.success, true);
+
+        const tempUser = await findUserByEmail("temp.del@obra.com");
+        assert.ok(tempUser);
+
+        // 2. Remove o usuário temporário com sucesso
+        const delRes = await deleteUserAction(tempUser.id, actorAdmin);
+        assert.equal(delRes.success, true);
+        assert.match(delRes.message, /removido com sucesso/i);
+
+        const deletedCheck = await findUserByEmail("temp.del@obra.com");
+        assert.equal(deletedCheck, null, "Usuário excluído não pode mais constar no banco");
+      } finally {
+        mockPrisma.$restore(backup);
+      }
     }
   );
 

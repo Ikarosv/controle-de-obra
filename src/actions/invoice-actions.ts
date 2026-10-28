@@ -2,10 +2,11 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { auth, signIn, signOut } from "@/auth";
 import { AuthError } from "next-auth";
+import { prisma } from "@/lib/prisma";
+import { Prisma } from "@prisma/client";
 import {
   createInvoiceSchema,
   createUserSchema,
@@ -20,12 +21,12 @@ import {
   type CreateInvoiceFormValues,
 } from "@/lib/validations/invoice";
 import {
-  readLocalStore,
-  writeLocalStore,
   DEFAULT_PROJECT_SETTINGS,
+  findUserByEmail,
   type Role,
+  type SplitStatus,
 } from "@/lib/db";
-import { toCents, fromCents } from "@/lib/split-calculator";
+import { toCents } from "@/lib/split-calculator";
 
 export type ActionResponse = {
   success: boolean;
@@ -91,7 +92,7 @@ function safeRevalidate(paths: string[]) {
       revalidatePath(p);
     }
   } catch {
-    // Ignorado quando executado fora do contexto de request HTTP do Next.js (ex: testes automatizados QA)
+    // Ignorado quando executado fora do contexto de request HTTP do Next.js (ex: CLI de QA)
   }
 }
 
@@ -106,11 +107,7 @@ export async function authenticateAction(
       redirect: false,
     });
 
-    const store = readLocalStore();
-    const user = store.users.find(
-      (u) => u.email.toLowerCase() === email.trim().toLowerCase()
-    );
-
+    const user = await findUserByEmail(email);
     const redirectUrl = user?.role === "ADMIN" ? "/admin" : "/meu-painel";
 
     return {
@@ -137,10 +134,11 @@ export async function logoutAction() {
 }
 
 export async function createInvoiceAction(
-  rawInput: CreateInvoiceFormValues
+  rawInput: CreateInvoiceFormValues,
+  _testActor?: SessionActor
 ): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
     const parsed = createInvoiceSchema.safeParse(rawInput);
     if (!parsed.success) {
@@ -153,53 +151,55 @@ export async function createInvoiceAction(
     }
 
     const data = parsed.data;
-    const store = readLocalStore();
+    const invoiceDate = new Date(
+      data.date.includes("T") ? data.date : `${data.date}T12:00:00.000Z`
+    );
 
-    const invoiceId = crypto.randomUUID();
-    const nowIso = new Date().toISOString();
-
-    store.invoices.push({
-      id: invoiceId,
-      documentNumber: data.documentNumber,
-      supplier: data.supplier,
-      date: data.date.includes("T") ? data.date : `${data.date}T12:00:00.000Z`,
-      categoryId: data.categoryId,
-      installments: data.installments,
-      pixKey: data.pixKey,
-      paidBy: data.paidBy,
-      observations: data.observations || null,
-      createdAt: nowIso,
-    });
-
-    for (const item of data.items) {
-      const itemId = crypto.randomUUID();
-      store.invoiceItems.push({
-        id: itemId,
-        invoiceId,
-        description: item.description,
-        unit: item.unit || "un",
-        quantity: Number(item.quantity),
-        totalValue: fromCents(toCents(item.totalValue)),
-        stage: item.stage,
-        splitModel: item.splitModel || "50/50",
+    await prisma.$transaction(async (tx) => {
+      const createdInvoice = await tx.invoice.create({
+        data: {
+          documentNumber: data.documentNumber,
+          supplier: data.supplier,
+          date: invoiceDate,
+          categoryId: data.categoryId,
+          installments: data.installments,
+          pixKey: data.pixKey,
+          paidBy: data.paidBy,
+          observations: data.observations || null,
+        },
       });
 
-      const activeSplits = item.splits.filter((s) => toCents(s.amountDue) > 0);
-      for (const split of activeSplits) {
-        store.itemSplits.push({
-          id: crypto.randomUUID(),
-          invoiceItemId: itemId,
-          userId: split.userId,
-          amountDue: fromCents(toCents(split.amountDue)),
-          status: split.status,
-          paidAt: split.status === "PAID" ? nowIso : null,
-          paymentNote:
-            split.status === "PAID" ? "Quitado no momento do lançamento" : null,
+      for (const item of data.items) {
+        const createdItem = await tx.invoiceItem.create({
+          data: {
+            invoiceId: createdInvoice.id,
+            description: item.description,
+            unit: item.unit || "un",
+            quantity: Number(item.quantity),
+            totalValue: new Prisma.Decimal(item.totalValue.toFixed(2)),
+            stage: item.stage,
+            splitModel: item.splitModel || "50/50",
+          },
         });
-      }
-    }
 
-    writeLocalStore(store);
+        const activeSplits = item.splits.filter((s) => toCents(s.amountDue) > 0);
+        for (const split of activeSplits) {
+          await tx.itemSplit.create({
+            data: {
+              invoiceItemId: createdItem.id,
+              userId: split.userId,
+              amountDue: new Prisma.Decimal(split.amountDue.toFixed(2)),
+              status: split.status as SplitStatus,
+              paidAt: split.status === "PAID" ? new Date() : null,
+              paymentNote:
+                split.status === "PAID"
+                  ? "Quitado no momento do lançamento"
+                  : null,
+            },
+          });
+        }
+      }
+    });
 
     safeRevalidate(["/admin", "/meu-painel"]);
 
@@ -210,7 +210,6 @@ export async function createInvoiceAction(
       }) registrada com sucesso!`,
     };
   } catch (error) {
-    console.error("[createInvoiceAction Error]:", error);
     return {
       success: false,
       message:
@@ -223,27 +222,32 @@ export async function createInvoiceAction(
 
 export async function toggleSplitStatusAction(
   splitId: string,
-  paymentNote?: string
+  paymentNote?: string,
+  _testActor?: SessionActor
 ): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
-    const store = readLocalStore();
-    const split = store.itemSplits.find((s) => s.id === splitId);
+    const split = await prisma.itemSplit.findUnique({
+      where: { id: splitId },
+    });
 
     if (!split) {
       return { success: false, message: "Cota de rateio não encontrada." };
     }
 
     const nextStatus = split.status === "PENDING" ? "PAID" : "PENDING";
-    split.status = nextStatus;
-    split.paidAt = nextStatus === "PAID" ? new Date().toISOString() : null;
-    split.paymentNote =
-      nextStatus === "PAID"
-        ? paymentNote || "Pagamento confirmado pelo Administrador"
-        : null;
-
-    writeLocalStore(store);
+    await prisma.itemSplit.update({
+      where: { id: splitId },
+      data: {
+        status: nextStatus,
+        paidAt: nextStatus === "PAID" ? new Date() : null,
+        paymentNote:
+          nextStatus === "PAID"
+            ? paymentNote || "Pagamento confirmado pelo Administrador"
+            : null,
+      },
+    });
 
     safeRevalidate(["/admin", "/meu-painel"]);
 
@@ -263,40 +267,123 @@ export async function toggleSplitStatusAction(
   }
 }
 
-export async function settleAllUserSplitsAction(
-  userId: string
+export async function confirmSplitPaymentAction(
+  splitId: string,
+  note?: string,
+  _testActor?: SessionActor
 ): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
-    const store = readLocalStore();
-    const nowIso = new Date().toISOString();
-    let count = 0;
+    const split = await prisma.itemSplit.findUnique({
+      where: { id: splitId },
+    });
 
-    for (const split of store.itemSplits) {
-      if (split.userId === userId && split.status === "PENDING") {
-        split.status = "PAID";
-        split.paidAt = nowIso;
-        split.paymentNote = "Quitação em lote pelo Administrador";
-        count++;
-      }
+    if (!split) {
+      return { success: false, message: "Cota de rateio não encontrada." };
     }
 
-    if (count === 0) {
+    await prisma.itemSplit.update({
+      where: { id: splitId },
+      data: {
+        status: "PAID",
+        paidAt: new Date(),
+        paymentNote:
+          note || "Pagamento PIX conferido e confirmado pelo Administrador",
+      },
+    });
+
+    safeRevalidate(["/admin", "/meu-painel"]);
+
+    return {
+      success: true,
+      message: "Pagamento confirmado com sucesso!",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message:
+        error instanceof Error ? error.message : "Erro ao confirmar pagamento.",
+    };
+  }
+}
+
+export async function rejectSplitPaymentNoticeAction(
+  splitId: string,
+  rejectionReason?: string,
+  _testActor?: SessionActor
+): Promise<ActionResponse> {
+  try {
+    await resolveAdminActor(_testActor);
+
+    const split = await prisma.itemSplit.findUnique({
+      where: { id: splitId },
+    });
+
+    if (!split) {
+      return { success: false, message: "Cota de rateio não encontrada." };
+    }
+
+    await prisma.itemSplit.update({
+      where: { id: splitId },
+      data: {
+        status: "PENDING",
+        paidAt: null,
+        paymentNote: rejectionReason
+          ? `Aviso rejeitado: ${rejectionReason}`
+          : "Aviso de pagamento rejeitado pelo Administrador",
+      },
+    });
+
+    safeRevalidate(["/admin", "/meu-painel"]);
+
+    return {
+      success: true,
+      message: "Aviso de pagamento rejeitado.",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message:
+        error instanceof Error
+          ? error.message
+          : "Erro ao rejeitar aviso de pagamento.",
+    };
+  }
+}
+
+export async function settleAllUserSplitsAction(
+  userId: string,
+  _testActor?: SessionActor
+): Promise<ActionResponse> {
+  try {
+    await resolveAdminActor(_testActor);
+
+    const result = await prisma.itemSplit.updateMany({
+      where: {
+        userId,
+        status: "PENDING",
+      },
+      data: {
+        status: "PAID",
+        paidAt: new Date(),
+        paymentNote: "Quitação em lote pelo Administrador",
+      },
+    });
+
+    if (result.count === 0) {
       return {
         success: false,
         message: "Este participante não possui cotas pendentes.",
       };
     }
 
-    writeLocalStore(store);
-
     safeRevalidate(["/admin", "/meu-painel"]);
 
     return {
       success: true,
-      message: `${count} ${
-        count === 1 ? "cota foi quitada" : "cotas foram quitadas"
+      message: `${result.count} ${
+        result.count === 1 ? "cota foi quitada" : "cotas foram quitadas"
       } com sucesso!`,
     };
   } catch (error) {
@@ -309,32 +396,23 @@ export async function settleAllUserSplitsAction(
 }
 
 export async function deleteInvoiceAction(
-  invoiceId: string
+  invoiceId: string,
+  _testActor?: SessionActor
 ): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
-    const store = readLocalStore();
-    const inv = store.invoices.find((i) => i.id === invoiceId);
+    const inv = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+    });
     if (!inv) {
       return { success: false, message: "Nota fiscal não encontrada." };
     }
 
-    const itemIds = new Set(
-      store.invoiceItems
-        .filter((item) => item.invoiceId === invoiceId)
-        .map((item) => item.id)
-    );
-
-    store.itemSplits = store.itemSplits.filter(
-      (s) => !itemIds.has(s.invoiceItemId)
-    );
-    store.invoiceItems = store.invoiceItems.filter(
-      (item) => item.invoiceId !== invoiceId
-    );
-    store.invoices = store.invoices.filter((i) => i.id !== invoiceId);
-
-    writeLocalStore(store);
+    // O cascade no schema Prisma já remove automaticamente os itens e splits vinculados
+    await prisma.invoice.delete({
+      where: { id: invoiceId },
+    });
 
     safeRevalidate(["/admin", "/meu-painel"]);
 
@@ -351,16 +429,25 @@ export async function deleteInvoiceAction(
   }
 }
 
-export async function createUserAction(rawInput: {
-  name: string;
-  email: string;
-  password: string;
-  role: "ADMIN" | "PARTICIPANT";
-  phone?: string;
-  avatarColor?: string;
-}): Promise<ActionResponse> {
+export async function createUserAction(
+  rawInput: {
+    name: string;
+    email: string;
+    password: string;
+    role: "ADMIN" | "PARTICIPANT";
+    phone?: string;
+    avatarColor?: string;
+  },
+  _testActor?: SessionActor
+): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    const actor = await resolveAdminActor(_testActor);
+    if (actor.role !== "ADMIN") {
+      return {
+        success: false,
+        message: "Acesso restrito ao Administrador da Obra.",
+      };
+    }
 
     const parsed = createUserSchema.safeParse(rawInput);
     if (!parsed.success) {
@@ -371,12 +458,13 @@ export async function createUserAction(rawInput: {
     }
 
     const data = parsed.data;
-    const store = readLocalStore();
+    const normalizedEmail = data.email.trim().toLowerCase();
 
-    const exists = store.users.some(
-      (u) => u.email.toLowerCase() === data.email.toLowerCase()
-    );
-    if (exists) {
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (existingUser) {
       return {
         success: false,
         message: "Já existe um usuário cadastrado com este e-mail.",
@@ -385,18 +473,16 @@ export async function createUserAction(rawInput: {
 
     const passwordHash = await bcrypt.hash(data.password, 10);
 
-    store.users.push({
-      id: crypto.randomUUID(),
-      name: data.name,
-      email: data.email,
-      passwordHash,
-      role: data.role,
-      avatarColor: data.avatarColor || "#C26D53",
-      phone: data.phone || null,
-      createdAt: new Date().toISOString(),
+    await prisma.user.create({
+      data: {
+        name: data.name,
+        email: normalizedEmail,
+        passwordHash,
+        role: data.role,
+        phone: data.phone || null,
+        avatarColor: data.avatarColor || "#C26D53",
+      },
     });
-
-    writeLocalStore(store);
 
     safeRevalidate(["/admin"]);
 
@@ -405,6 +491,15 @@ export async function createUserAction(rawInput: {
       message: `Usuário ${data.name} (${data.role}) cadastrado com sucesso!`,
     };
   } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      return {
+        success: false,
+        message: "Já existe um usuário cadastrado com este e-mail.",
+      };
+    }
     return {
       success: false,
       message:
@@ -413,13 +508,16 @@ export async function createUserAction(rawInput: {
   }
 }
 
-export async function createCategoryAction(rawInput: {
-  name: string;
-  description?: string;
-  budgetLimit?: number;
-}): Promise<ActionResponse> {
+export async function createCategoryAction(
+  rawInput: {
+    name: string;
+    description?: string;
+    budgetLimit?: number;
+  },
+  _testActor?: SessionActor
+): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
     const parsed = createCategorySchema.safeParse(rawInput);
     if (!parsed.success) {
@@ -430,33 +528,45 @@ export async function createCategoryAction(rawInput: {
       };
     }
 
-    const store = readLocalStore();
-    const exists = store.categories.some(
-      (c) => c.name.toLowerCase() === parsed.data.name.toLowerCase()
-    );
-    if (exists) {
+    const { name, description, budgetLimit } = parsed.data;
+
+    const existing = await prisma.category.findUnique({
+      where: { name },
+    });
+    if (existing) {
       return {
         success: false,
         message: "Esta categoria já está cadastrada.",
       };
     }
 
-    store.categories.push({
-      id: crypto.randomUUID(),
-      name: parsed.data.name,
-      description: parsed.data.description || null,
-      budgetLimit: parsed.data.budgetLimit || null,
-      createdAt: new Date().toISOString(),
+    await prisma.category.create({
+      data: {
+        name,
+        description: description || null,
+        budgetLimit:
+          budgetLimit !== undefined && budgetLimit !== null
+            ? new Prisma.Decimal(budgetLimit.toFixed(2))
+            : null,
+      },
     });
 
-    writeLocalStore(store);
     safeRevalidate(["/admin"]);
 
     return {
       success: true,
-      message: `Categoria "${parsed.data.name}" adicionada!`,
+      message: `Categoria "${name}" adicionada!`,
     };
   } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      return {
+        success: false,
+        message: "Esta categoria já está cadastrada.",
+      };
+    }
     return {
       success: false,
       message:
@@ -465,12 +575,15 @@ export async function createCategoryAction(rawInput: {
   }
 }
 
-export async function updateStageBudgetAction(rawInput: {
-  stage: string;
-  budgetLimit: number;
-}): Promise<ActionResponse> {
+export async function updateStageBudgetAction(
+  rawInput: {
+    stage: string;
+    budgetLimit: number;
+  },
+  _testActor?: SessionActor
+): Promise<ActionResponse> {
   try {
-    await requireAdmin();
+    await resolveAdminActor(_testActor);
 
     const parsed = updateStageBudgetSchema.safeParse(rawInput);
     if (!parsed.success) {
@@ -480,28 +593,25 @@ export async function updateStageBudgetAction(rawInput: {
       };
     }
 
-    const store = readLocalStore();
-    const existing = store.stageBudgets.find(
-      (b) => b.stage === parsed.data.stage
-    );
+    const { stage, budgetLimit } = parsed.data;
 
-    if (existing) {
-      existing.budgetLimit = Number(parsed.data.budgetLimit);
-    } else {
-      store.stageBudgets.push({
-        id: crypto.randomUUID(),
-        stage: parsed.data.stage,
-        budgetLimit: Number(parsed.data.budgetLimit),
-        orderIndex: store.stageBudgets.length,
-      });
-    }
+    await prisma.stageBudget.upsert({
+      where: { stage },
+      update: {
+        budgetLimit: new Prisma.Decimal(budgetLimit.toFixed(2)),
+      },
+      create: {
+        stage,
+        budgetLimit: new Prisma.Decimal(budgetLimit.toFixed(2)),
+        orderIndex: await prisma.stageBudget.count(),
+      },
+    });
 
-    writeLocalStore(store);
     safeRevalidate(["/admin"]);
 
     return {
       success: true,
-      message: `Meta da etapa "${parsed.data.stage}" atualizada!`,
+      message: `Meta da etapa "${stage}" atualizada!`,
     };
   } catch (error) {
     return {
@@ -511,10 +621,6 @@ export async function updateStageBudgetAction(rawInput: {
     };
   }
 }
-
-// ============================================================================
-// NOVAS SERVER ACTIONS (ETAPA 2): CONFIGURAÇÕES DA OBRA, SENHAS, ANTI-IDOR PIX
-// ============================================================================
 
 export async function updateProjectSettingsAction(
   rawInput: {
@@ -550,42 +656,55 @@ export async function updateProjectSettingsAction(
       data.applyToPendingInvoices ?? data.updatePendingInvoicesPix
     );
 
-    const store = readLocalStore();
-    const nowIso = new Date().toISOString();
-
-    const updatedSettings = {
-      id: store.projectSettings?.id || DEFAULT_PROJECT_SETTINGS.id,
-      projectName: data.projectName,
-      officialPixKey: data.officialPixKey,
-      pixReceiverName: data.pixReceiverName,
-      updatedAt: nowIso,
-    };
-
-    store.projectSettings = updatedSettings;
-    store.settings = updatedSettings;
-
     let updatedInvoicesCount = 0;
-    if (shouldApplyToPending) {
-      const pendingItemIds = new Set(
-        store.itemSplits
-          .filter((s) => s.status === "PENDING")
-          .map((s) => s.invoiceItemId)
-      );
-      const pendingInvoiceIds = new Set(
-        store.invoiceItems
-          .filter((item) => pendingItemIds.has(item.id))
-          .map((item) => item.invoiceId)
-      );
 
-      for (const inv of store.invoices) {
-        if (pendingInvoiceIds.has(inv.id)) {
-          inv.pixKey = data.officialPixKey;
-          updatedInvoicesCount++;
+    await prisma.$transaction(async (tx) => {
+      await tx.projectSettings.upsert({
+        where: { id: "default" },
+        update: {
+          projectName: data.projectName,
+          officialPixKey: data.officialPixKey,
+          pixReceiverName: data.pixReceiverName,
+        },
+        create: {
+          id: "default",
+          projectName: data.projectName,
+          officialPixKey: data.officialPixKey,
+          pixReceiverName: data.pixReceiverName,
+        },
+      });
+
+      if (shouldApplyToPending) {
+        const pendingInvoices = await tx.invoice.findMany({
+          where: {
+            items: {
+              some: {
+                splits: {
+                  some: {
+                    status: "PENDING",
+                  },
+                },
+              },
+            },
+          },
+          select: { id: true },
+        });
+
+        if (pendingInvoices.length > 0) {
+          const invoiceIds = pendingInvoices.map((inv) => inv.id);
+          const updateResult = await tx.invoice.updateMany({
+            where: {
+              id: { in: invoiceIds },
+            },
+            data: {
+              pixKey: data.officialPixKey,
+            },
+          });
+          updatedInvoicesCount = updateResult.count;
         }
       }
-    }
+    });
 
-    writeLocalStore(store);
     safeRevalidate(["/admin", "/meu-painel"]);
 
     return {
@@ -627,9 +746,11 @@ export async function changeOwnPasswordAction(
       };
     }
 
-    const store = readLocalStore();
     // Anti-IDOR: busca estritamente pelo ID do usuário autenticado na sessão
-    const user = store.users.find((u) => u.id === actor.id);
+    const user = await prisma.user.findUnique({
+      where: { id: actor.id },
+    });
+
     if (!user) {
       return {
         success: false,
@@ -648,8 +769,12 @@ export async function changeOwnPasswordAction(
       };
     }
 
-    user.passwordHash = await bcrypt.hash(parsed.data.newPassword, 10);
-    writeLocalStore(store);
+    const newHash = await bcrypt.hash(parsed.data.newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: actor.id },
+      data: { passwordHash: newHash },
+    });
 
     safeRevalidate(["/admin", "/meu-painel"]);
 
@@ -694,10 +819,10 @@ export async function adminResetUserPasswordAction(
       };
     }
 
-    const store = readLocalStore();
-    const targetUser = store.users.find(
-      (u) => u.id === parsed.data.targetUserId
-    );
+    const targetUser = await prisma.user.findUnique({
+      where: { id: parsed.data.targetUserId },
+    });
+
     if (!targetUser) {
       return {
         success: false,
@@ -705,8 +830,12 @@ export async function adminResetUserPasswordAction(
       };
     }
 
-    targetUser.passwordHash = await bcrypt.hash(parsed.data.newPassword, 10);
-    writeLocalStore(store);
+    const newHash = await bcrypt.hash(parsed.data.newPassword, 10);
+
+    await prisma.user.update({
+      where: { id: parsed.data.targetUserId },
+      data: { passwordHash: newHash },
+    });
 
     safeRevalidate(["/admin"]);
 
@@ -760,8 +889,10 @@ export async function deleteUserAction(
       };
     }
 
-    const store = readLocalStore();
-    const targetUser = store.users.find((u) => u.id === targetUserId);
+    const targetUser = await prisma.user.findUnique({
+      where: { id: targetUserId },
+    });
+
     if (!targetUser) {
       return {
         success: false,
@@ -769,9 +900,9 @@ export async function deleteUserAction(
       };
     }
 
-    const splitsCount = store.itemSplits.filter(
-      (s) => s.userId === targetUserId
-    ).length;
+    const splitsCount = await prisma.itemSplit.count({
+      where: { userId: targetUserId },
+    });
 
     if (splitsCount > 0) {
       return {
@@ -781,8 +912,9 @@ export async function deleteUserAction(
       };
     }
 
-    store.users = store.users.filter((u) => u.id !== targetUserId);
-    writeLocalStore(store);
+    await prisma.user.delete({
+      where: { id: targetUserId },
+    });
 
     safeRevalidate(["/admin"]);
 
@@ -791,12 +923,20 @@ export async function deleteUserAction(
       message: `Participante ${targetUser.name} removido com sucesso.`,
     };
   } catch (error) {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2003"
+    ) {
+      return {
+        success: false,
+        message:
+          "Não é possível remover o participante pois existem registros dependentes vinculados no banco de dados.",
+      };
+    }
     return {
       success: false,
       message:
-        error instanceof Error
-          ? error.message
-          : "Erro ao remover participante.",
+        error instanceof Error ? error.message : "Erro ao remover participante.",
     };
   }
 }
@@ -821,8 +961,10 @@ export async function reportSplitPaymentNoticeAction(
       };
     }
 
-    const store = readLocalStore();
-    const split = store.itemSplits.find((s) => s.id === parsed.data.splitId);
+    const split = await prisma.itemSplit.findUnique({
+      where: { id: parsed.data.splitId },
+    });
+
     if (!split) {
       return {
         success: false,
@@ -830,7 +972,7 @@ export async function reportSplitPaymentNoticeAction(
       };
     }
 
-    // Blindagem Anti-IDOR estrita: o usuário autenticado deve ser dono estrito da cota
+    // Blindagem Anti-IDOR estrita: o usuário autenticado deve ser titular estrito da cota
     if (split.userId !== actor.id) {
       return {
         success: false,
@@ -846,8 +988,12 @@ export async function reportSplitPaymentNoticeAction(
       };
     }
 
-    split.paymentNote = `PIX informado: ${parsed.data.note}`;
-    writeLocalStore(store);
+    await prisma.itemSplit.update({
+      where: { id: parsed.data.splitId },
+      data: {
+        paymentNote: `PIX informado: ${parsed.data.note}`,
+      },
+    });
 
     safeRevalidate(["/meu-painel", "/admin"]);
 
@@ -889,31 +1035,30 @@ export async function reportAllPendingSplitsNoticeAction(
       };
     }
 
-    const store = readLocalStore();
-    let updatedCount = 0;
+    // Anti-IDOR: filtra estritamente por split.userId === actor.id e status PENDING
+    const result = await prisma.itemSplit.updateMany({
+      where: {
+        userId: actor.id,
+        status: "PENDING",
+      },
+      data: {
+        paymentNote: `PIX informado: ${parsed.data.note}`,
+      },
+    });
 
-    for (const split of store.itemSplits) {
-      // Anti-IDOR: filtra estritamente por split.userId === actor.id e status PENDING
-      if (split.userId === actor.id && split.status === "PENDING") {
-        split.paymentNote = `PIX informado: ${parsed.data.note}`;
-        updatedCount++;
-      }
-    }
-
-    if (updatedCount === 0) {
+    if (result.count === 0) {
       return {
         success: false,
         message: "Você não possui cotas pendentes no momento.",
       };
     }
 
-    writeLocalStore(store);
     safeRevalidate(["/meu-painel", "/admin"]);
 
     return {
       success: true,
-      message: `Aviso de PIX registrado em ${updatedCount} ${
-        updatedCount === 1 ? "cota pendente" : "cotas pendentes"
+      message: `Aviso de PIX registrado em ${result.count} ${
+        result.count === 1 ? "cota pendente" : "cotas pendentes"
       }! O Administrador fará a conferência.`,
     };
   } catch (error) {

@@ -415,7 +415,16 @@ export function AdminDashboard({
     });
   };
 
-  const handleDeleteUser = (targetUserId: string) => {
+  const handleDeleteUser = (
+    targetUserId: string,
+    targetUserName: string,
+    targetUserEmail: string
+  ) => {
+    const confirmed = window.confirm(
+      `Tem certeza de que deseja remover o participante "${targetUserName}" (${targetUserEmail})?\n\nEsta ação excluirá permanentemente o participante do banco de dados e não poderá ser desfeita.`
+    );
+    if (!confirmed) return;
+
     setFeedback(null);
     startTransition(async () => {
       const res = await deleteUserAction({ targetUserId });
@@ -1449,18 +1458,30 @@ export function AdminDashboard({
                               Redefinir Senha
                             </button>
 
-                            {canDelete && (
+                            {canDelete ? (
                               <button
                                 type="button"
                                 disabled={isPending}
-                                onClick={() => handleDeleteUser(u.id)}
-                                title="Remover participante sem cotas vinculadas"
+                                onClick={() =>
+                                  handleDeleteUser(u.id, u.name, u.email)
+                                }
+                                title="Remover participante (sem cotas vinculadas)"
                                 className="inline-flex items-center gap-1 rounded-lg border border-[#C26D53]/30 bg-[#C26D53]/10 px-2.5 py-1 font-medium text-[#9A4B34] transition-colors hover:bg-[#C26D53]/20"
                               >
                                 <Trash2 className="h-3 w-3" />
                                 Remover
                               </button>
-                            )}
+                            ) : !isSelf && u.role !== "ADMIN" && u.splitsCount > 0 ? (
+                              <span
+                                title="Participante possui cotas vinculadas a notas fiscais. Não pode ser removido para manter a integridade contábil."
+                                className="inline-flex items-center gap-1 rounded-lg border border-[#E6E1DA] bg-white px-2.5 py-1 text-[11px] font-medium text-[#78716C]"
+                              >
+                                {u.splitsCount}{" "}
+                                {u.splitsCount === 1
+                                  ? "cota vinculada"
+                                  : "cotas vinculadas"}
+                              </span>
+                            ) : null}
                           </div>
                         </div>
 
